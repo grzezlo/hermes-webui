@@ -486,7 +486,7 @@ def test_switch_to_daily_builds_recipe_installs_and_restarts(daily_env):
     assert "Health: ok" in result.stdout
     assert "upstream/master + gz/tools + feat/a" in result.stdout
     assert len(worktrees(repo)) == 1
-    assert not list(repo.parent.glob("hermes-daily.*"))
+    assert not list((repo / ".git").glob("hermes-daily.*"))
 
 
 def test_unchanged_daily_does_not_switch_or_restart(daily_env):
@@ -554,7 +554,7 @@ def test_conflict_leaves_checkout_and_daily_unchanged(daily_env):
     assert not git("status", "--porcelain", "--untracked-files=no", cwd=repo).stdout
     assert not any("restart" in call or "install" in call for call in daily_calls(daily_env))
     assert len(worktrees(repo)) == 1
-    assert not list(repo.parent.glob("hermes-daily.*"))
+    assert not list((repo / ".git").glob("hermes-daily.*"))
 
 
 def test_recorded_conflict_resolution_is_reused(daily_env):
@@ -562,16 +562,19 @@ def test_recorded_conflict_resolution_is_reused(daily_env):
     commit_on(repo, "feat/b", start, {"a.txt": "b\n"})
     commit_on(repo, "gz/tools", rev(repo, "gz/tools"), {"daily.topics": RECIPE + "feat/b\n"})
     # Resolve the conflict once by hand with rerere enabled, as documented.
+    # No background auto-maintenance: it writes into the worktree's admin dir
+    # and races the removal below.
+    quiet = ("-c", "gc.auto=0", "-c", "maintenance.auto=false")
     git("config", "rerere.enabled", "true", cwd=repo)
     scratch = repo.parent / "resolve"
-    git("worktree", "add", "--quiet", "--detach", str(scratch), "upstream/master", cwd=repo)
+    git(*quiet, "worktree", "add", "--quiet", "--detach", str(scratch), "upstream/master", cwd=repo)
     for topic in ("gz/tools", "feat/a"):
-        git("merge", "--quiet", "--no-edit", topic, cwd=scratch)
-    assert subprocess.run(["git", "merge", "--no-edit", "feat/b"], cwd=scratch,
+        git(*quiet, "merge", "--quiet", "--no-edit", topic, cwd=scratch)
+    assert subprocess.run(["git", *quiet, "merge", "--no-edit", "feat/b"], cwd=scratch,
                           capture_output=True).returncode != 0
     (scratch / "a.txt").write_text("a and b\n")
     git("add", "a.txt", cwd=scratch)
-    git("commit", "--quiet", "--no-edit", cwd=scratch)
+    git(*quiet, "commit", "--quiet", "--no-edit", cwd=scratch)
     git("worktree", "remove", "--force", str(scratch), cwd=repo)
     result = run_daily(daily_env, "--switch-to-daily")
     assert result.returncode == 0, result.stdout + result.stderr
@@ -645,3 +648,61 @@ def test_launcher_runs_upgrade_from_tools_branch(daily_env):
     assert f"Repository: {repo}" in result.stdout
     assert "Trial build from current refs succeeded" in result.stdout
     assert not list(repo.parent.glob("hermes-upgrade.*"))
+
+
+def test_failed_install_after_switch_is_retried(daily_env):
+    repo = daily_env[0]
+    failed = run_daily(daily_env, "--switch-to-daily", PIP_FAIL="1")
+    assert failed.returncode != 0
+    assert current_branch(repo) == "daily"
+    assert not any("restart" in call for call in daily_calls(daily_env))
+    reset_calls(daily_env)
+    result = run_daily(daily_env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "up to date" not in result.stdout
+    invoked = daily_calls(daily_env)
+    assert any(call[:4] == ["runtime", "-m", "pip", "install"] for call in invoked)
+    assert any("restart" in call for call in invoked)
+    assert "Health: ok" in result.stdout
+
+
+def test_failed_health_after_switch_is_retried(daily_env, monkeypatch):
+    # The fixture's /health server reads this from the test process.
+    monkeypatch.setenv("FIXTURE_HEALTH", "degraded")
+    failed = run_daily(daily_env, "--switch-to-daily")
+    assert failed.returncode != 0
+    assert "Health check failed" in failed.stderr
+    monkeypatch.delenv("FIXTURE_HEALTH")
+    reset_calls(daily_env)
+    result = run_daily(daily_env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert any("restart" in call for call in daily_calls(daily_env))
+
+
+def test_stale_recipe_does_not_block_pull_on_other_branch(daily_env):
+    repo = daily_env[0]
+    commit_on(repo, "gz/tools", rev(repo, "gz/tools"), {"daily.topics": RECIPE + "feat/gone\n"})
+    result = run_daily(daily_env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "cryptography" in (repo / "requirements.txt").read_text()
+    assert current_branch(repo) != "daily"
+
+
+def test_recipe_keeps_hash_inside_branch_names(daily_env):
+    repo, start = daily_env[0], daily_env[4]
+    commit_on(repo, "fix/#12-b", start, {"b.txt": "b\n"})
+    commit_on(repo, "gz/tools", rev(repo, "gz/tools"),
+              {"daily.topics": "# recipe\r\nfeat/a\r\nfix/#12-b   # PR #12\r\n"})
+    result = run_daily(daily_env, "--switch-to-daily")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (repo / "b.txt").read_text() == "b\n"
+    assert "gz/tools + feat/a + fix/#12-b" in result.stdout
+
+
+def test_dry_run_on_current_daily_still_prints_the_plan(daily_env):
+    assert run_daily(daily_env, "--switch-to-daily").returncode == 0
+    result = run_daily(daily_env, "--dry-run")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "a real run fetches first" in result.stdout
+    assert "Would run: git fetch --no-tags upstream master" in result.stdout
+    assert "Would run: systemctl --user restart" in result.stdout

@@ -90,7 +90,9 @@ hand; it is always regenerated, so everything it contains must live on another
 branch (topic branches from other people's forks should be copied to your own).
 
 The recipe `daily.topics` on `gz/tools` lists local topic branches, one per line,
-merged in order. `#` starts a comment.
+merged in order. `#` at the start of a line or after whitespace starts a comment.
+In pull mode on other branches the recipe is only used to refuse a topic branch,
+so a stale recipe never blocks an ordinary pull.
 
 ```text
 fix/session-row-keyboard-activation   # PR #8214
@@ -101,26 +103,34 @@ With `daily` checked out, `upgrade.sh`:
 1. reads the recipe from the `gz/tools` ref (not from the working tree) and
    checks every listed branch exists;
 2. runs `git fetch --no-tags upstream master`;
-3. builds the new daily in a temporary `git worktree`: `upstream/master`, then
+3. builds the new daily in a temporary `git worktree` under `.git` (on disk;
+   `/tmp` may be RAM-backed): `upstream/master`, then
    `gz/tools`, then each topic as its own `daily: merge <topic>` merge commit,
    with `rerere` replaying recorded conflict resolutions;
 4. reports a topic that is already in `upstream/master`, so it can be removed
-   from the recipe once its PR is merged;
+   from the recipe once its PR is merged. This works when upstream merges the
+   PR's own commits (as this project's stage branches do); a squash or rebase
+   merge is not detected, and the old topic then merges as a no-op or conflicts;
 5. stops on a conflict rerere cannot resolve, removes the worktree and leaves
    the checkout, `daily` and the service untouched;
-6. stops without switching or restarting when the build has the same content
-   as the current `daily`;
+6. stops without switching or restarting when `daily` already passed the health
+   check and either the inputs (the `upstream/master`, `gz/tools` and topic
+   commits) or the built content are unchanged. The inputs and the last healthy
+   commit are kept in `.git/hermes-webui-daily.state`; a run that switched but
+   failed to install, restart or pass `/health` is retried by the next run;
 7. otherwise switches the checkout with `git switch -C daily`, keeps the
    replaced build as `daily-prev`, installs or checks requirements, restarts
    and checks `/health` exactly as in the ordinary mode.
 
 A failed switch (for example an untracked file in the way) leaves `daily`
 unchanged and does not restart. `--rollback` switches `daily` and `daily-prev`
-and restarts; a second rollback returns to where you were. On a branch listed in
+and restarts; a second rollback returns to where you were. A rollback lasts until
+the next ordinary run, which rebuilds from the recipe and moves forward again. On a branch listed in
 the recipe the script refuses to run, because pulling a PR branch is rarely what
 an upgrade means; `--switch-to-daily` builds and switches from any branch.
 `--dry-run` makes a trial build from the current refs without fetching, then
-discards it.
+discards it. The trial still writes merge objects (unreferenced, removed by
+`git gc`) and, with rerere, may record conflict preimages in `.git/rr-cache`.
 
 The whole script is a single compound command, so Bash parses all of it before
 the switch can replace the file. Git replaces files rather than rewriting them in
@@ -158,9 +168,8 @@ chmod +x ~/.local/bin/hermes-upgrade
 hermes-upgrade --dry-run
 ```
 
-It uses `$HERMES_WEBUI_REPO` (default `~/hermes-webui`) and
-`$HERMES_UPGRADE_TOOLS_BRANCH` (default `gz/tools`). Reinstall the copy when the
-launcher itself changes; changes to `upgrade.sh` need no reinstall.
+It uses `$HERMES_WEBUI_REPO` (default `~/hermes-webui`). Reinstall the copy when
+the launcher itself changes; changes to `upgrade.sh` need no reinstall.
 
 ## Verification
 

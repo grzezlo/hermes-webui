@@ -6,7 +6,8 @@
 set -euo pipefail
 
 repo="${HERMES_WEBUI_REPO:-$HOME/hermes-webui}"
-tools="${HERMES_UPGRADE_TOOLS_BRANCH:-gz/tools}"
+# Must match TOOLS in upgrade.sh, which reads the recipe from the same branch.
+tools=gz/tools
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/hermes-upgrade.XXXXXX")"
 trap 'rm -rf "$tmp"' EXIT
 git -C "$repo" show "refs/heads/$tools:upgrade.sh" > "$tmp/upgrade.sh" || {

@@ -83,18 +83,44 @@ flock -n 9 || fail 'Another upgrade is running.'
 
 BRANCH="$(git symbolic-ref --quiet --short HEAD || true)"
 TOPICS=()
+RAW_TOPICS=()
+RECIPE_ERROR=
 # Read the recipe from the tools branch itself, never from the working tree:
-# a PR branch checked out from master has no copy of it.
-read_topics() {
-  local text line topic extra seen=" "
-  git rev-parse --verify --quiet "refs/heads/$TOOLS^{commit}" >/dev/null || fail "Missing branch $TOOLS."
-  text="$(git show "refs/heads/$TOOLS:$RECIPE")" || fail "Cannot read $RECIPE from $TOOLS."
-  TOPICS=()
+# a PR branch checked out from master has no copy of it. Sets RAW_TOPICS, or
+# RECIPE_ERROR without failing, so pull mode can ignore a broken recipe.
+parse_recipe() {
+  local text line topic extra
+  RAW_TOPICS=()
+  RECIPE_ERROR=
+  if ! git rev-parse --verify --quiet "refs/heads/$TOOLS^{commit}" >/dev/null; then
+    RECIPE_ERROR="Missing branch $TOOLS."
+    return 0
+  fi
+  if ! text="$(git show "refs/heads/$TOOLS:$RECIPE" 2>/dev/null)"; then
+    RECIPE_ERROR="Cannot read $RECIPE from $TOOLS."
+    return 0
+  fi
   while IFS= read -r line; do
-    line="${line%%#*}"
+    line="${line%$'\r'}"
+    # A comment starts the line or follows whitespace; '#' is legal in a branch.
+    [[ "$line" != \#* ]] || continue
+    line="${line%%[[:space:]]#*}"
     read -r topic extra <<< "$line" || true
     [[ -n "$topic" ]] || continue
-    [[ -z "$extra" ]] || fail "$RECIPE: one branch per line: $line"
+    if [[ -n "$extra" ]]; then
+      RECIPE_ERROR="$RECIPE: one branch per line: $line"
+      return 0
+    fi
+    RAW_TOPICS+=("$topic")
+  done <<< "$text"
+}
+
+read_topics() {
+  local topic seen=" "
+  parse_recipe
+  [[ -z "$RECIPE_ERROR" ]] || fail "$RECIPE_ERROR"
+  TOPICS=()
+  for topic in "${RAW_TOPICS[@]}"; do
     git check-ref-format --branch "$topic" >/dev/null 2>&1 || fail "$RECIPE: invalid branch name: $topic"
     case "$topic" in
       "$DAILY"|"$DAILY_PREV"|"$TOOLS") fail "$RECIPE must not list $topic." ;;
@@ -103,7 +129,7 @@ read_topics() {
     seen+="$topic "
     git rev-parse --verify --quiet "refs/heads/$topic^{commit}" >/dev/null || fail "Topic branch $topic from $RECIPE does not exist locally."
     TOPICS+=("$topic")
-  done <<< "$text"
+  done
 }
 
 if [[ "$ROLLBACK" == 1 ]]; then
@@ -115,9 +141,10 @@ elif [[ "$BRANCH" == "$DAILY" || "$SWITCH" == 1 ]]; then
   read_topics
 else
   GIT_MODE=pull
-  if [[ -n "$BRANCH" ]] && git rev-parse --verify --quiet "refs/heads/$TOOLS^{commit}" >/dev/null; then
-    read_topics
-    for topic in "${TOPICS[@]}"; do
+  if [[ -n "$BRANCH" ]]; then
+    # Only membership matters here; a stale recipe must not block a pull.
+    parse_recipe
+    for topic in "${RAW_TOPICS[@]}"; do
       [[ "$topic" != "$BRANCH" ]] || fail "$BRANCH is a topic branch from $RECIPE; use --switch-to-daily to build $DAILY and switch to it."
     done
   fi
@@ -302,15 +329,24 @@ trap cleanup_build EXIT
 build_daily() {
   local tree topic unmerged
   git rev-parse --verify --quiet "refs/remotes/$BASE^{commit}" >/dev/null || fail "Missing $BASE; fetch $BASE_REMOTE first."
-  BUILD_DIR="$(mktemp -d "${TMPDIR:-/tmp}/hermes-daily.XXXXXX")"
+  # Inside the git dir, on disk: /tmp may be a RAM-backed tmpfs.
+  BUILD_DIR="$(mktemp -d "$(git rev-parse --path-format=absolute --git-common-dir)/hermes-daily.XXXXXX")"
   tree="$BUILD_DIR/tree"
-  git worktree add --quiet --detach "$tree" "refs/remotes/$BASE" >/dev/null 2>&1 || fail 'Cannot create a temporary worktree for the daily build.'
+  # No background auto-maintenance: it writes into the worktree's admin dir
+  # and races the removal in cleanup_build.
+  if ! git -c gc.auto=0 -c maintenance.auto=false \
+      worktree add --quiet --detach "$tree" "refs/remotes/$BASE" >"$BUILD_DIR/merge.log" 2>&1; then
+    cat "$BUILD_DIR/merge.log" >&2
+    fail 'Cannot create a temporary worktree for the daily build.'
+  fi
   for topic in "$TOOLS" "${TOPICS[@]}"; do
     if git merge-base --is-ancestor "refs/heads/$topic" "refs/remotes/$BASE"; then
-      printf '[upgrade] Note: %s is already in %s; remove it from %s.\n' "$topic" "$BASE" "$RECIPE"
+      if [[ "$topic" != "$TOOLS" ]]; then
+        printf '[upgrade] Note: %s is already in %s; remove it from %s.\n' "$topic" "$BASE" "$RECIPE"
+      fi
       continue
     fi
-    if ! git -C "$tree" -c rerere.enabled=true -c rerere.autoUpdate=true \
+    if ! git -C "$tree" -c gc.auto=0 -c maintenance.auto=false -c rerere.enabled=true -c rerere.autoUpdate=true \
         merge --quiet --no-ff --no-edit -m "daily: merge $topic" "refs/heads/$topic" >"$BUILD_DIR/merge.log" 2>&1; then
       if ! git -C "$tree" rev-parse --verify --quiet MERGE_HEAD >/dev/null; then
         cat "$BUILD_DIR/merge.log" >&2
@@ -321,7 +357,7 @@ build_daily() {
         printf '[upgrade] Conflict merging %s:\n%s\n' "$topic" "$unmerged" >&2
         fail "Resolve it once with rerere enabled, then rerun; $DAILY and the checkout were not changed."
       fi
-      git -C "$tree" commit --quiet --no-edit >/dev/null
+      git -C "$tree" -c gc.auto=0 -c maintenance.auto=false commit --quiet --no-edit >/dev/null
       printf '[upgrade] Reused a recorded conflict resolution for %s.\n' "$topic"
     fi
   done
@@ -340,19 +376,58 @@ switch_daily() {
   fi
 }
 
+# The last daily that passed the health check, and the inputs it was built
+# from. "Up to date" needs both: a run that switched but then failed to install,
+# restart or pass /health must be retried, not reported as current.
+STATE_FILE="$(git rev-parse --git-path hermes-webui-daily.state)"
+STATE_INPUTS=
+STATE_HEALTHY=
+if [[ -f "$STATE_FILE" ]]; then
+  while IFS='=' read -r key value; do
+    case "$key" in
+      inputs) STATE_INPUTS="$value" ;;
+      healthy) STATE_HEALTHY="$value" ;;
+    esac
+  done < "$STATE_FILE"
+fi
+write_state() {
+  printf 'inputs=%s\nhealthy=%s\n' "$1" "$2" > "$STATE_FILE.tmp"
+  mv -f "$STATE_FILE.tmp" "$STATE_FILE"
+}
+daily_inputs() {
+  local topic
+  {
+    printf '%s %s\n' "$BASE" "$(git rev-parse "refs/remotes/$BASE")"
+    for topic in "$TOOLS" "${TOPICS[@]}"; do
+      printf '%s %s\n' "$topic" "$(git rev-parse "refs/heads/$topic")"
+    done
+  } | git hash-object --stdin
+}
+
 UNCHANGED=0
 NEW_DAILY=
+INPUTS=
 if [[ "$GIT_MODE" == daily ]]; then
   PHASE='daily build'
   if [[ "$DRY_RUN" == 0 ]]; then
     git fetch --quiet --no-tags "$BASE_REMOTE" "$BASE_BRANCH"
   fi
-  build_daily
-  if git rev-parse --verify --quiet "refs/heads/$DAILY^{commit}" >/dev/null && \
-      [[ "$(git rev-parse "$NEW_DAILY^{tree}")" == "$(git rev-parse "refs/heads/$DAILY^{tree}")" ]]; then
-    # Same content: keep the existing commit instead of a new identical merge.
-    NEW_DAILY="$(git rev-parse "refs/heads/$DAILY")"
-    [[ "$BRANCH" != "$DAILY" ]] || UNCHANGED=1
+  INPUTS="$(daily_inputs)"
+  CURRENT="$(git rev-parse --verify --quiet "refs/heads/$DAILY^{commit}" || true)"
+  if [[ "$BRANCH" == "$DAILY" && -n "$CURRENT" && "$STATE_HEALTHY" == "$CURRENT" && "$STATE_INPUTS" == "$INPUTS" ]]; then
+    # Same inputs as the last healthy build: skip the worktree entirely.
+    NEW_DAILY="$CURRENT"
+    UNCHANGED=1
+  else
+    build_daily
+    if [[ -n "$CURRENT" && "$(git rev-parse "$NEW_DAILY^{tree}")" == "$(git rev-parse "$CURRENT^{tree}")" ]]; then
+      # Same content: keep the existing commit instead of a new identical merge.
+      NEW_DAILY="$CURRENT"
+      if [[ "$BRANCH" == "$DAILY" && "$STATE_HEALTHY" == "$CURRENT" ]]; then
+        UNCHANGED=1
+        [[ "$DRY_RUN" == 1 ]] || write_state "$INPUTS" "$CURRENT"
+      fi
+    fi
   fi
   printf '[upgrade] Daily: %s + %s' "$BASE" "$TOOLS"
   for topic in "${TOPICS[@]}"; do printf ' + %s' "$topic"; done
@@ -363,14 +438,21 @@ fi
 
 printf '[upgrade] Repository: %s\n[upgrade] Runtime: %s\n' "$REPO_ROOT" "$PYTHON"
 printf '[upgrade] Dependency mode: %s\n' "$MODE"
-if [[ "$UNCHANGED" == 1 ]]; then
+if [[ "$UNCHANGED" == 1 && "$DRY_RUN" == 0 ]]; then
   printf '[upgrade] %s is up to date (%s); nothing to switch or restart.\n' "$DAILY" "$(git rev-parse --short HEAD)"
   exit 0
 fi
 if [[ "$DRY_RUN" == 1 ]]; then
   case "$GIT_MODE" in
     pull) printf '[upgrade] Would run: git pull --ff-only\n' ;;
-    daily) printf '[upgrade] Trial build from current refs succeeded (not fetched).\n[upgrade] Would run: git fetch --no-tags %s %s, rebuild, and switch the checkout to %s\n' "$BASE_REMOTE" "$BASE_BRANCH" "$DAILY" ;;
+    daily)
+      if [[ "$UNCHANGED" == 1 ]]; then
+        printf '[upgrade] Current refs (not fetched) give the running %s; a real run fetches first and restarts only if that changes it.\n' "$DAILY"
+      else
+        printf '[upgrade] Trial build from current refs succeeded (not fetched).\n'
+      fi
+      printf '[upgrade] Would run: git fetch --no-tags %s %s, rebuild, and switch the checkout to %s\n' "$BASE_REMOTE" "$BASE_BRANCH" "$DAILY"
+      ;;
     rollback) printf '[upgrade] Would switch %s back to %s (%s)\n' "$DAILY" "$DAILY_PREV" "$(git rev-parse --short "$NEW_DAILY")" ;;
   esac
   if [[ "$MODE" == managed ]]; then
@@ -413,6 +495,12 @@ for ((attempt=0; attempt<30; attempt++)); do
   if systemctl --user is-active --quiet "$SERVICE" && \
       BODY="$(hermes_webui_probe_health "$HOST" "$PORT" /health 2 direct)" && \
       printf '%s' "$BODY" | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("status") == "ok" else 1)' 2>/dev/null; then
+    if [[ "$GIT_MODE" == daily ]]; then
+      write_state "$INPUTS" "$(git rev-parse HEAD)"
+    elif [[ "$GIT_MODE" == rollback ]]; then
+      # No recipe inputs for a rollback: the next run rebuilds and moves forward.
+      write_state '' "$(git rev-parse HEAD)"
+    fi
     printf '[upgrade] Health: ok\n[upgrade] Commit: %s\n' "$(git rev-parse --short HEAD)"
     exit 0
   fi
