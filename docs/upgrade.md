@@ -17,7 +17,8 @@ interpreter and local health endpoint from its live process. It supports direct
 by Hermes' launcher. Inline code is parsed as an AST, never evaluated by the
 detector; merely mentioning the correct server path is not accepted.
 
-It refuses unknown runtime ownership, a server from another checkout, an
+It refuses to start with less than 1024 MB free on the repository disk
+(`HERMES_UPGRADE_MIN_FREE_MB` changes the threshold). It refuses unknown runtime ownership, a server from another checkout, an
 unverified system interpreter, missing pip in ordinary venv mode, tracked local
 changes, or concurrent upgrades. It checks that the interpreter still matches
 the live executable and revalidates process identity and dependency selection

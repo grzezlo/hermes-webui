@@ -706,3 +706,23 @@ def test_dry_run_on_current_daily_still_prints_the_plan(daily_env):
     assert "a real run fetches first" in result.stdout
     assert "Would run: git fetch --no-tags upstream master" in result.stdout
     assert "Would run: systemctl --user restart" in result.stdout
+
+
+@pytest.mark.parametrize("mode", ["pull", "daily"])
+def test_low_disk_space_stops_before_any_change(daily_env, mode):
+    repo = daily_env[0]
+    head = rev(repo, "HEAD")
+    args = ["--switch-to-daily"] if mode == "daily" else []
+    result = run_daily(daily_env, *args, HERMES_UPGRADE_MIN_FREE_MB=str(10 ** 12))
+    assert result.returncode != 0
+    assert "MB free on the repository disk" in result.stderr
+    assert rev(repo, "HEAD") == head
+    assert git("branch", "--list", "daily", cwd=repo).stdout == ""
+    assert not daily_calls(daily_env)
+
+
+def test_invalid_minimum_free_space_is_rejected(daily_env):
+    result = run_daily(daily_env, HERMES_UPGRADE_MIN_FREE_MB="lots")
+    assert result.returncode != 0
+    assert "must be a whole number" in result.stderr
+    assert not daily_calls(daily_env)

@@ -80,6 +80,15 @@ fi
 [[ -z "$(git status --porcelain --untracked-files=no)" ]] || fail 'Tracked local changes detected; commit or stash them first.'
 exec 9>"$(git rev-parse --git-path hermes-webui-upgrade.lock)"
 flock -n 9 || fail 'Another upgrade is running.'
+# Stop before fetching, building or installing on a nearly full disk: a daily
+# build checks out a full worktree under .git, and pip may unpack wheels.
+MIN_FREE_MB="${HERMES_UPGRADE_MIN_FREE_MB:-1024}"
+[[ "$MIN_FREE_MB" =~ ^[0-9]+$ ]] || fail 'HERMES_UPGRADE_MIN_FREE_MB must be a whole number of MB.'
+FREE_KB="$(df -Pk "$(git rev-parse --path-format=absolute --git-common-dir)" | awk 'NR == 2 {print $4}')"
+[[ "$FREE_KB" =~ ^[0-9]+$ ]] || fail 'Cannot determine free disk space.'
+if (( FREE_KB / 1024 < MIN_FREE_MB )); then
+  fail "Only $((FREE_KB / 1024)) MB free on the repository disk; at least $MIN_FREE_MB MB needed. Free some space (or lower HERMES_UPGRADE_MIN_FREE_MB) and rerun."
+fi
 
 BRANCH="$(git symbolic-ref --quiet --short HEAD || true)"
 TOPICS=()
