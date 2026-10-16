@@ -1,0 +1,4 @@
+# Topic branches merged into daily, one per line, in this order,
+# on top of upstream/master + gz/tools. Comments start with #.
+# Remove a topic once upgrade.sh reports it is already in upstream/master.
+fix/session-row-keyboard-activation   # PR #8214

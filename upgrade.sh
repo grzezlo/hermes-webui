@@ -2,21 +2,69 @@
 # Upgrade this source checkout and its already-running systemd user service.
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# The whole script is one compound command, so Bash parses all of it before
+# running anything. Switching the checkout may replace this file mid-run.
+{
 SERVICE=hermes-webui.service
 PHASE=preflight
 DRY_RUN=0
+SWITCH=0
+ROLLBACK=0
+REPO_ARG=
+# Daily integration: upstream/master + the tools branch + the topics listed in
+# its recipe, rebuilt from scratch in a temporary worktree.
+DAILY=daily
+DAILY_PREV=daily-prev
+TOOLS=gz/tools
+RECIPE=daily.topics
+BASE_REMOTE=upstream
+BASE_BRANCH=master
+BASE="$BASE_REMOTE/$BASE_BRANCH"
+BUILD_DIR=
 fail() { printf '[upgrade] %s\n' "$*" >&2; exit 1; }
 trap 'printf "[upgrade] Failed during %s; no automatic rollback. Check git status and systemctl --user status %s.\n" "$PHASE" "$SERVICE" >&2' ERR
 
-if [[ "${1:-}" == --help && $# == 1 ]]; then
-  printf 'Usage: ./upgrade.sh [--dry-run | --help]\nUpdates the current Git upstream, installs requirements in the active service venv\n(or verifies them without installation in a Hermes-managed runtime), then restarts\nhermes-webui.service and checks local /health. Run without sudo.\n--dry-run checks the runtime and prints the plan without pulling/installing/restarting.\n'
-  exit 0
+usage() {
+  printf '%s\n' \
+    'Usage: upgrade.sh [--dry-run] [--switch-to-daily | --rollback] [--repo PATH] | --help' \
+    'Updates the checkout, installs requirements in the active service venv' \
+    '(or verifies them without installation in a Hermes-managed runtime), then restarts' \
+    'hermes-webui.service and checks local /health. Run without sudo.' \
+    '' \
+    "On the $DAILY branch, rebuilds it from $BASE + $TOOLS + the topic branches listed" \
+    "in $TOOLS:$RECIPE, in a temporary worktree, and switches the checkout only when" \
+    'the build succeeded. An unchanged build does not restart the service. On any other' \
+    "branch, follows its Git upstream with git pull --ff-only (refused on a topic branch)." \
+    '' \
+    "--switch-to-daily  build $DAILY and switch the checkout to it from any branch" \
+    "--rollback         switch $DAILY back to $DAILY_PREV (the build before the last switch)" \
+    '--repo PATH        upgrade the checkout at PATH instead of the script directory' \
+    '--dry-run          check the runtime and print the plan; a daily trial build uses' \
+    '                   current refs without fetching and is discarded'
+}
+
+while (($#)); do
+  case "$1" in
+    --help) usage; exit 0 ;;
+    --dry-run) DRY_RUN=1 ;;
+    --switch-to-daily) SWITCH=1 ;;
+    --rollback) ROLLBACK=1 ;;
+    --repo)
+      [[ $# -ge 2 && -n "$2" ]] || fail '--repo needs a path.'
+      REPO_ARG="$2"
+      shift
+      ;;
+    *) fail 'Unknown argument. Use --help.' ;;
+  esac
+  shift
+done
+if [[ "$SWITCH" == 1 && "$ROLLBACK" == 1 ]]; then
+  fail '--switch-to-daily and --rollback cannot be combined.'
 fi
-if [[ "${1:-}" == --dry-run && $# == 1 ]]; then
-  DRY_RUN=1
-elif [[ $# != 0 ]]; then
-  fail 'Unknown argument. Use --help.'
+if [[ -n "$REPO_ARG" ]]; then
+  REPO_ROOT="$(cd "$REPO_ARG" && pwd -P)" || fail "Cannot open repository: $REPO_ARG"
+else
+  REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 fi
 [[ $EUID != 0 ]] || fail 'Run as the service user, without sudo.'
 for command in git systemctl python3 flock; do
@@ -24,11 +72,57 @@ for command in git systemctl python3 flock; do
 done
 command -v curl >/dev/null || command -v wget >/dev/null || fail 'curl or wget is required.'
 cd "$REPO_ROOT"
-[[ "$(git rev-parse --show-toplevel)" == "$REPO_ROOT" ]] || fail 'The script must be in the checkout root.'
+if [[ -n "$REPO_ARG" ]]; then
+  [[ "$(git rev-parse --show-toplevel 2>/dev/null)" == "$REPO_ROOT" ]] || fail 'The --repo path must be a checkout root.'
+else
+  [[ "$(git rev-parse --show-toplevel)" == "$REPO_ROOT" ]] || fail 'The script must be in the checkout root.'
+fi
 [[ -z "$(git status --porcelain --untracked-files=no)" ]] || fail 'Tracked local changes detected; commit or stash them first.'
-git rev-parse --abbrev-ref '@{upstream}' >/dev/null || fail 'No Git upstream configured.'
 exec 9>"$(git rev-parse --git-path hermes-webui-upgrade.lock)"
 flock -n 9 || fail 'Another upgrade is running.'
+
+BRANCH="$(git symbolic-ref --quiet --short HEAD || true)"
+TOPICS=()
+# Read the recipe from the tools branch itself, never from the working tree:
+# a PR branch checked out from master has no copy of it.
+read_topics() {
+  local text line topic extra seen=" "
+  git rev-parse --verify --quiet "refs/heads/$TOOLS^{commit}" >/dev/null || fail "Missing branch $TOOLS."
+  text="$(git show "refs/heads/$TOOLS:$RECIPE")" || fail "Cannot read $RECIPE from $TOOLS."
+  TOPICS=()
+  while IFS= read -r line; do
+    line="${line%%#*}"
+    read -r topic extra <<< "$line" || true
+    [[ -n "$topic" ]] || continue
+    [[ -z "$extra" ]] || fail "$RECIPE: one branch per line: $line"
+    git check-ref-format --branch "$topic" >/dev/null 2>&1 || fail "$RECIPE: invalid branch name: $topic"
+    case "$topic" in
+      "$DAILY"|"$DAILY_PREV"|"$TOOLS") fail "$RECIPE must not list $topic." ;;
+    esac
+    [[ "$seen" != *" $topic "* ]] || fail "$RECIPE lists $topic twice."
+    seen+="$topic "
+    git rev-parse --verify --quiet "refs/heads/$topic^{commit}" >/dev/null || fail "Topic branch $topic from $RECIPE does not exist locally."
+    TOPICS+=("$topic")
+  done <<< "$text"
+}
+
+if [[ "$ROLLBACK" == 1 ]]; then
+  GIT_MODE=rollback
+  [[ "$BRANCH" == "$DAILY" ]] || fail "--rollback works only with $DAILY checked out."
+  git rev-parse --verify --quiet "refs/heads/$DAILY_PREV^{commit}" >/dev/null || fail "No $DAILY_PREV to roll back to."
+elif [[ "$BRANCH" == "$DAILY" || "$SWITCH" == 1 ]]; then
+  GIT_MODE=daily
+  read_topics
+else
+  GIT_MODE=pull
+  if [[ -n "$BRANCH" ]] && git rev-parse --verify --quiet "refs/heads/$TOOLS^{commit}" >/dev/null; then
+    read_topics
+    for topic in "${TOPICS[@]}"; do
+      [[ "$topic" != "$BRANCH" ]] || fail "$BRANCH is a topic branch from $RECIPE; use --switch-to-daily to build $DAILY and switch to it."
+    done
+  fi
+  git rev-parse --abbrev-ref '@{upstream}' >/dev/null || fail 'No Git upstream configured.'
+fi
 systemctl --user is-active --quiet "$SERVICE" || fail 'The user service must already be running so its runtime can be identified safely.'
 PID="$(systemctl --user show "$SERVICE" --property=MainPID --value)"
 [[ "$PID" =~ ^[1-9][0-9]*$ ]] || fail 'Cannot identify service PID.'
@@ -194,10 +288,91 @@ if [[ "$MODE" == managed ]]; then
 else
   "$PYTHON" -I -m pip --version >/dev/null || fail 'The service venv has no pip; no changes made.'
 fi
+cleanup_build() {
+  [[ -n "$BUILD_DIR" ]] || return 0
+  git -C "$REPO_ROOT" worktree remove --force "$BUILD_DIR/tree" >/dev/null 2>&1 || true
+  rm -rf "$BUILD_DIR"
+  git -C "$REPO_ROOT" worktree prune >/dev/null 2>&1 || true
+  BUILD_DIR=
+}
+trap cleanup_build EXIT
+
+# Build the daily commit in a temporary worktree; the checkout is untouched.
+# Sets NEW_DAILY. A conflict that rerere cannot resolve aborts the build.
+build_daily() {
+  local tree topic unmerged
+  git rev-parse --verify --quiet "refs/remotes/$BASE^{commit}" >/dev/null || fail "Missing $BASE; fetch $BASE_REMOTE first."
+  BUILD_DIR="$(mktemp -d "${TMPDIR:-/tmp}/hermes-daily.XXXXXX")"
+  tree="$BUILD_DIR/tree"
+  git worktree add --quiet --detach "$tree" "refs/remotes/$BASE" >/dev/null 2>&1 || fail 'Cannot create a temporary worktree for the daily build.'
+  for topic in "$TOOLS" "${TOPICS[@]}"; do
+    if git merge-base --is-ancestor "refs/heads/$topic" "refs/remotes/$BASE"; then
+      printf '[upgrade] Note: %s is already in %s; remove it from %s.\n' "$topic" "$BASE" "$RECIPE"
+      continue
+    fi
+    if ! git -C "$tree" -c rerere.enabled=true -c rerere.autoUpdate=true \
+        merge --quiet --no-ff --no-edit -m "daily: merge $topic" "refs/heads/$topic" >"$BUILD_DIR/merge.log" 2>&1; then
+      if ! git -C "$tree" rev-parse --verify --quiet MERGE_HEAD >/dev/null; then
+        cat "$BUILD_DIR/merge.log" >&2
+        fail "Merging $topic failed; $DAILY and the checkout were not changed."
+      fi
+      unmerged="$(git -C "$tree" diff --name-only --diff-filter=U)"
+      if [[ -n "$unmerged" ]]; then
+        printf '[upgrade] Conflict merging %s:\n%s\n' "$topic" "$unmerged" >&2
+        fail "Resolve it once with rerere enabled, then rerun; $DAILY and the checkout were not changed."
+      fi
+      git -C "$tree" commit --quiet --no-edit >/dev/null
+      printf '[upgrade] Reused a recorded conflict resolution for %s.\n' "$topic"
+    fi
+  done
+  NEW_DAILY="$(git -C "$tree" rev-parse HEAD)"
+  cleanup_build
+}
+
+# Switch the checkout to $DAILY at $1. A failed checkout leaves the branch as
+# it was; the replaced daily becomes $DAILY_PREV only after a successful one.
+switch_daily() {
+  local old
+  old="$(git rev-parse --verify --quiet "refs/heads/$DAILY^{commit}" || true)"
+  git switch --quiet --no-guess -C "$DAILY" "$1" || fail "Cannot switch the checkout to $DAILY; it was not changed. Move the files Git names above and rerun."
+  if [[ -n "$old" && "$old" != "$1" ]]; then
+    git branch --force "$DAILY_PREV" "$old"
+  fi
+}
+
+UNCHANGED=0
+NEW_DAILY=
+if [[ "$GIT_MODE" == daily ]]; then
+  PHASE='daily build'
+  if [[ "$DRY_RUN" == 0 ]]; then
+    git fetch --quiet --no-tags "$BASE_REMOTE" "$BASE_BRANCH"
+  fi
+  build_daily
+  if git rev-parse --verify --quiet "refs/heads/$DAILY^{commit}" >/dev/null && \
+      [[ "$(git rev-parse "$NEW_DAILY^{tree}")" == "$(git rev-parse "refs/heads/$DAILY^{tree}")" ]]; then
+    # Same content: keep the existing commit instead of a new identical merge.
+    NEW_DAILY="$(git rev-parse "refs/heads/$DAILY")"
+    [[ "$BRANCH" != "$DAILY" ]] || UNCHANGED=1
+  fi
+  printf '[upgrade] Daily: %s + %s' "$BASE" "$TOOLS"
+  for topic in "${TOPICS[@]}"; do printf ' + %s' "$topic"; done
+  printf '\n'
+elif [[ "$GIT_MODE" == rollback ]]; then
+  NEW_DAILY="$(git rev-parse "refs/heads/$DAILY_PREV")"
+fi
+
 printf '[upgrade] Repository: %s\n[upgrade] Runtime: %s\n' "$REPO_ROOT" "$PYTHON"
 printf '[upgrade] Dependency mode: %s\n' "$MODE"
+if [[ "$UNCHANGED" == 1 ]]; then
+  printf '[upgrade] %s is up to date (%s); nothing to switch or restart.\n' "$DAILY" "$(git rev-parse --short HEAD)"
+  exit 0
+fi
 if [[ "$DRY_RUN" == 1 ]]; then
-  printf '[upgrade] Would run: git pull --ff-only\n'
+  case "$GIT_MODE" in
+    pull) printf '[upgrade] Would run: git pull --ff-only\n' ;;
+    daily) printf '[upgrade] Trial build from current refs succeeded (not fetched).\n[upgrade] Would run: git fetch --no-tags %s %s, rebuild, and switch the checkout to %s\n' "$BASE_REMOTE" "$BASE_BRANCH" "$DAILY" ;;
+    rollback) printf '[upgrade] Would switch %s back to %s (%s)\n' "$DAILY" "$DAILY_PREV" "$(git rev-parse --short "$NEW_DAILY")" ;;
+  esac
   if [[ "$MODE" == managed ]]; then
     printf '[upgrade] Would recheck pulled requirements in the committed Hermes environment (no pip install).\n'
   else
@@ -208,9 +383,15 @@ if [[ "$DRY_RUN" == 1 ]]; then
   exit 0
 fi
 
-PHASE='Git pull'
-revalidate_runtime
-git pull --ff-only
+if [[ "$GIT_MODE" == pull ]]; then
+  PHASE='Git pull'
+  revalidate_runtime
+  git pull --ff-only
+else
+  PHASE='checkout switch'
+  revalidate_runtime
+  switch_daily "$NEW_DAILY"
+fi
 PHASE='dependency installation'
 revalidate_runtime
 if [[ "$MODE" == managed ]]; then
@@ -238,3 +419,5 @@ for ((attempt=0; attempt<30; attempt++)); do
   sleep 1
 done
 fail "Health check failed. Inspect: journalctl --user -u $SERVICE -n 80"
+exit
+}

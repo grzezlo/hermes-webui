@@ -70,7 +70,8 @@ else:
 ''')
     service.chmod(0o755)
     runtime_dir = tmp_path / "runtime-venv"
-    venv.EnvBuilder(with_pip=False).create(runtime_dir)
+    # Symlink the interpreter: a copied one costs ~60 MB of tmpfs per test.
+    venv.EnvBuilder(with_pip=False, symlinks=True).create(runtime_dir)
     python = runtime_dir / "bin/python"
     site = next((runtime_dir / "lib").glob("python*/site-packages"))
     (site / "pip.py").write_text('''import json, os, sys
@@ -400,3 +401,247 @@ def test_unhealthy_http_200_is_not_success(upgrade_env, monkeypatch):
     assert result.returncode != 0
     assert "Health check failed" in result.stderr
     assert "Health: ok" not in result.stdout
+
+
+# Daily integration mode: upstream/master + gz/tools + recipe topics, built in a
+# temporary worktree. The script runs from outside the checkout with --repo,
+# as the hermes-upgrade launcher does.
+
+def commit_on(repo, branch, parent, files, message="change"):
+    index = repo.parent / "daily-index"
+    env = {**os.environ, "GIT_INDEX_FILE": str(index)}
+    run = lambda *args, **kw: subprocess.run(["git", *args], cwd=repo, env=env, check=True,
+                                            capture_output=True, text=True, **kw).stdout.strip()
+    run("read-tree", parent)
+    for name, text in files.items():
+        blob = run("hash-object", "-w", "--stdin", input=text)
+        run("update-index", "--add", "--cacheinfo", f"100644,{blob},{name}")
+    commit = run("commit-tree", run("write-tree"), "-p", parent, "-m", message)
+    run("update-ref", f"refs/heads/{branch}", commit)
+    index.unlink()
+    return commit
+
+
+def rev(repo, ref):
+    return git("rev-parse", ref, cwd=repo).stdout.strip()
+
+
+def current_branch(repo):
+    return git("symbolic-ref", "--quiet", "--short", "HEAD", cwd=repo).stdout.strip()
+
+
+RECIPE = "# recipe\nfeat/a   # first topic\n"
+
+
+@pytest.fixture
+def daily_env(upgrade_env, tmp_path):
+    repo, env, log = upgrade_env
+    # upstream/master carries the "new dependency" commit the checkout lacks.
+    git("push", "origin", "HEAD:refs/heads/master", cwd=tmp_path / "source")
+    git("config", "user.email", "test@example.invalid", cwd=repo)
+    git("config", "user.name", "Test", cwd=repo)
+    git("remote", "add", "upstream", str(tmp_path / "remote.git"), cwd=repo)
+    git("fetch", "--quiet", "upstream", cwd=repo)
+    start = rev(repo, "HEAD")
+    commit_on(repo, "gz/tools", start, {"tools.txt": "tools\n", "daily.topics": RECIPE})
+    commit_on(repo, "feat/a", start, {"a.txt": "a\n"})
+    launch = tmp_path / "launch"
+    launch.mkdir()
+    shutil.copy2(ROOT / "upgrade.sh", launch / "upgrade.sh")
+    return repo, env, log, launch, start
+
+
+def run_daily(fixture, *args, **overrides):
+    repo, env, _, launch, _ = fixture
+    return subprocess.run(["bash", str(launch / "upgrade.sh"), "--repo", str(repo), *args], cwd=launch,
+                          env={**env, **overrides}, capture_output=True, text=True, timeout=50)
+
+
+def daily_calls(fixture):
+    return calls(fixture[:3])
+
+
+def reset_calls(fixture):
+    fixture[2].unlink(missing_ok=True)
+
+
+def worktrees(repo):
+    return [line for line in git("worktree", "list", "--porcelain", cwd=repo).stdout.splitlines()
+            if line.startswith("worktree ")]
+
+
+def test_switch_to_daily_builds_recipe_installs_and_restarts(daily_env):
+    repo = daily_env[0]
+    result = run_daily(daily_env, "--switch-to-daily")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert current_branch(repo) == "daily"
+    assert (repo / "a.txt").read_text() == "a\n"
+    assert (repo / "tools.txt").read_text() == "tools\n"
+    assert "cryptography" in (repo / "requirements.txt").read_text()
+    subjects = git("log", "--format=%s", "upstream/master..daily", cwd=repo).stdout.splitlines()
+    assert subjects[:2] == ["daily: merge feat/a", "daily: merge gz/tools"]
+    invoked = daily_calls(daily_env)
+    assert any(call[:4] == ["runtime", "-m", "pip", "install"] for call in invoked)
+    assert any("restart" in call for call in invoked)
+    assert "Health: ok" in result.stdout
+    assert "upstream/master + gz/tools + feat/a" in result.stdout
+    assert len(worktrees(repo)) == 1
+    assert not list(repo.parent.glob("hermes-daily.*"))
+
+
+def test_unchanged_daily_does_not_switch_or_restart(daily_env):
+    repo = daily_env[0]
+    assert run_daily(daily_env, "--switch-to-daily").returncode == 0
+    before = rev(repo, "daily")
+    reset_calls(daily_env)
+    result = run_daily(daily_env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "up to date" in result.stdout
+    assert rev(repo, "daily") == before
+    assert not any("restart" in call or "install" in call for call in daily_calls(daily_env))
+
+
+def test_rebuild_picks_up_topic_change_and_keeps_previous(daily_env):
+    repo = daily_env[0]
+    assert run_daily(daily_env, "--switch-to-daily").returncode == 0
+    first = rev(repo, "daily")
+    commit_on(repo, "feat/a", rev(repo, "feat/a"), {"a.txt": "a2\n"})
+    reset_calls(daily_env)
+    result = run_daily(daily_env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (repo / "a.txt").read_text() == "a2\n"
+    assert rev(repo, "daily-prev") == first
+    assert any("restart" in call for call in daily_calls(daily_env))
+
+
+def test_rollback_swaps_daily_and_previous(daily_env):
+    repo = daily_env[0]
+    assert run_daily(daily_env, "--switch-to-daily").returncode == 0
+    first = rev(repo, "daily")
+    commit_on(repo, "feat/a", rev(repo, "feat/a"), {"a.txt": "a2\n"})
+    assert run_daily(daily_env).returncode == 0
+    second = rev(repo, "daily")
+    reset_calls(daily_env)
+    result = run_daily(daily_env, "--rollback")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (rev(repo, "daily"), rev(repo, "daily-prev")) == (first, second)
+    assert (repo / "a.txt").read_text() == "a\n"
+    assert any("restart" in call for call in daily_calls(daily_env))
+
+
+def test_topic_branch_requires_explicit_switch(daily_env):
+    repo = daily_env[0]
+    git("switch", "--quiet", "feat/a", cwd=repo)
+    result = run_daily(daily_env)
+    assert result.returncode != 0
+    assert "use --switch-to-daily" in result.stderr
+    assert current_branch(repo) == "feat/a"
+    assert not daily_calls(daily_env)
+
+
+def test_conflict_leaves_checkout_and_daily_unchanged(daily_env):
+    repo, start = daily_env[0], daily_env[4]
+    assert run_daily(daily_env, "--switch-to-daily").returncode == 0
+    before = rev(repo, "daily")
+    commit_on(repo, "feat/b", start, {"a.txt": "b\n"})
+    commit_on(repo, "gz/tools", rev(repo, "gz/tools"), {"daily.topics": RECIPE + "feat/b\n"})
+    reset_calls(daily_env)
+    result = run_daily(daily_env)
+    assert result.returncode != 0
+    assert "Conflict merging feat/b" in result.stderr
+    assert "a.txt" in result.stderr
+    assert rev(repo, "daily") == before == rev(repo, "HEAD")
+    assert not git("status", "--porcelain", "--untracked-files=no", cwd=repo).stdout
+    assert not any("restart" in call or "install" in call for call in daily_calls(daily_env))
+    assert len(worktrees(repo)) == 1
+    assert not list(repo.parent.glob("hermes-daily.*"))
+
+
+def test_recorded_conflict_resolution_is_reused(daily_env):
+    repo, start = daily_env[0], daily_env[4]
+    commit_on(repo, "feat/b", start, {"a.txt": "b\n"})
+    commit_on(repo, "gz/tools", rev(repo, "gz/tools"), {"daily.topics": RECIPE + "feat/b\n"})
+    # Resolve the conflict once by hand with rerere enabled, as documented.
+    git("config", "rerere.enabled", "true", cwd=repo)
+    scratch = repo.parent / "resolve"
+    git("worktree", "add", "--quiet", "--detach", str(scratch), "upstream/master", cwd=repo)
+    for topic in ("gz/tools", "feat/a"):
+        git("merge", "--quiet", "--no-edit", topic, cwd=scratch)
+    assert subprocess.run(["git", "merge", "--no-edit", "feat/b"], cwd=scratch,
+                          capture_output=True).returncode != 0
+    (scratch / "a.txt").write_text("a and b\n")
+    git("add", "a.txt", cwd=scratch)
+    git("commit", "--quiet", "--no-edit", cwd=scratch)
+    git("worktree", "remove", "--force", str(scratch), cwd=repo)
+    result = run_daily(daily_env, "--switch-to-daily")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Reused a recorded conflict resolution for feat/b" in result.stdout
+    assert (repo / "a.txt").read_text() == "a and b\n"
+
+
+def test_topic_already_upstream_is_reported(daily_env, tmp_path):
+    repo = daily_env[0]
+    git("push", "--quiet", str(tmp_path / "remote.git"), "feat/a:refs/heads/side", cwd=repo)
+    source = tmp_path / "source"
+    git("fetch", "--quiet", "origin", "side", cwd=source)
+    git("merge", "--quiet", "--no-edit", "FETCH_HEAD", cwd=source)
+    git("push", "--quiet", "origin", "HEAD:refs/heads/master", cwd=source)
+    result = run_daily(daily_env, "--switch-to-daily")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "feat/a is already in upstream/master; remove it from daily.topics" in result.stdout
+    assert (repo / "a.txt").read_text() == "a\n"
+
+
+def test_daily_dry_run_does_not_fetch_switch_or_restart(daily_env, tmp_path):
+    repo = daily_env[0]
+    upstream_before = rev(repo, "upstream/master")
+    source = tmp_path / "source"
+    (source / "later.txt").write_text("later\n")
+    git("add", "later.txt", cwd=source)
+    git("commit", "--quiet", "-m", "later", cwd=source)
+    git("push", "--quiet", "origin", "HEAD:refs/heads/master", cwd=source)
+    head = rev(repo, "HEAD")
+    result = run_daily(daily_env, "--dry-run", "--switch-to-daily")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Trial build from current refs succeeded" in result.stdout
+    assert rev(repo, "upstream/master") == upstream_before
+    assert rev(repo, "HEAD") == head
+    assert git("branch", "--list", "daily", cwd=repo).stdout == ""
+    assert not any("restart" in call or "install" in call for call in daily_calls(daily_env))
+    assert len(worktrees(repo)) == 1
+
+
+def test_missing_topic_branch_fails_before_changes(daily_env):
+    repo = daily_env[0]
+    commit_on(repo, "gz/tools", rev(repo, "gz/tools"), {"daily.topics": RECIPE + "feat/gone\n"})
+    head = rev(repo, "HEAD")
+    result = run_daily(daily_env, "--switch-to-daily")
+    assert result.returncode != 0
+    assert "feat/gone from daily.topics does not exist locally" in result.stderr
+    assert rev(repo, "HEAD") == head
+    assert not daily_calls(daily_env)
+
+
+def test_blocked_switch_keeps_daily_and_service(daily_env):
+    repo = daily_env[0]
+    (repo / "a.txt").write_text("untracked local file\n")
+    result = run_daily(daily_env, "--switch-to-daily")
+    assert result.returncode != 0
+    assert "Cannot switch the checkout to daily" in result.stderr
+    assert git("branch", "--list", "daily", cwd=repo).stdout == ""
+    assert (repo / "a.txt").read_text() == "untracked local file\n"
+    assert not any("restart" in call or "install" in call for call in daily_calls(daily_env))
+
+
+def test_launcher_runs_upgrade_from_tools_branch(daily_env):
+    repo, env, _, launch, _ = daily_env
+    commit_on(repo, "gz/tools", rev(repo, "gz/tools"),
+              {"upgrade.sh": (ROOT / "upgrade.sh").read_text()})
+    shutil.copy2(ROOT / "hermes-upgrade", launch / "hermes-upgrade")
+    result = subprocess.run(["bash", str(launch / "hermes-upgrade"), "--dry-run", "--switch-to-daily"],
+                            cwd=launch, env={**env, "HERMES_WEBUI_REPO": str(repo)},
+                            capture_output=True, text=True, timeout=50)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f"Repository: {repo}" in result.stdout
+    assert "Trial build from current refs succeeded" in result.stdout
+    assert not list(repo.parent.glob("hermes-upgrade.*"))

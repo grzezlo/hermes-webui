@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Run upgrade.sh from the tools branch, whatever the checkout has checked out.
+# Install a copy outside the checkout, e.g.:
+#   git show gz/tools:hermes-upgrade > ~/.local/bin/hermes-upgrade
+#   chmod +x ~/.local/bin/hermes-upgrade
+set -euo pipefail
+
+repo="${HERMES_WEBUI_REPO:-$HOME/hermes-webui}"
+tools="${HERMES_UPGRADE_TOOLS_BRANCH:-gz/tools}"
+tmp="$(mktemp -d "${TMPDIR:-/tmp}/hermes-upgrade.XXXXXX")"
+trap 'rm -rf "$tmp"' EXIT
+git -C "$repo" show "refs/heads/$tools:upgrade.sh" > "$tmp/upgrade.sh" || {
+  printf '[hermes-upgrade] Cannot read upgrade.sh from %s in %s.\n' "$tools" "$repo" >&2
+  exit 1
+}
+bash "$tmp/upgrade.sh" --repo "$repo" "$@"
