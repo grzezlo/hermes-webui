@@ -189,26 +189,41 @@ class TestTreeLongPress:
         body = _slice_function(UI_JS, "_renderTreeItems")
         for evt in ("touchstart", "touchmove", "touchend", "touchcancel"):
             assert f"addEventListener('{evt}'" in body, f"missing {evt} handler"
-        assert "},500);" in body, "long-press threshold must be 500ms"
+        assert re.search(r"\},500\)", body), "long-press threshold must be 500ms"
         assert "'long-pressing'" in body
         assert re.search(r"if\(_lpHandled\)\{te\.preventDefault\(\);te\.stopPropagation\(\);\}", body), (
             "touchend must swallow the synthetic click after the menu opened"
+        )
+        # The armed timer must live in the module-level slot (not a per-row
+        # closure) so a tree re-render can cancel it before the row is detached.
+        assert re.search(r"_treeRowLongPress=\{el,token,timer:setTimeout\(", body), (
+            "the armed timer must be reachable by _cancelTreeRowLongPress()"
         )
 
     def test_native_contextmenu_cancels_pending_timer(self):
         body = _slice_function(UI_JS, "_renderTreeItems")
         ctx = body[body.index("el.oncontextmenu") : body.index("el.ondragstart")]
-        assert "clearTimeout(_lpTimer)" in ctx, (
+        assert "_cancelTreeRowLongPress()" in ctx, (
             "the native contextmenu path must cancel a pending long-press timer "
             "so one gesture never opens two menus (Windows touch)"
         )
 
     def test_long_press_style_present(self):
         assert ".file-item.long-pressing{" in STYLE_CSS
-        rule = STYLE_CSS[STYLE_CSS.index(".file-item.long-pressing{") :]
-        rule = rule[: rule.index("}")]
-        assert "var(--hover-bg)" in rule
-        assert "animation:session-long-press" in rule
+        # Two rules mention the class now: the declaration and the reduced-motion
+        # override. Pin the declaration by its content, not by being first.
+        rules, idx = [], 0
+        while (idx := STYLE_CSS.find(".file-item.long-pressing{", idx)) != -1:
+            rules.append(STYLE_CSS[idx:][: STYLE_CSS[idx:].index("}")])
+            idx += 1
+        decl = next((r for r in rules if "var(--hover-bg)" in r), None)
+        assert decl is not None, "the .long-pressing declaration rule is missing"
+        assert "animation:session-long-press" in decl
+        motion = STYLE_CSS[STYLE_CSS.index("@media (prefers-reduced-motion:reduce)"):]
+        motion = motion[: motion.index("\n  }")]
+        assert ".file-item.long-pressing" in motion, (
+            "reduced-motion must neutralise the row long-press animation"
+        )
 
 
 # ── i18n keys in every locale block ──────────────────────────────────────────
