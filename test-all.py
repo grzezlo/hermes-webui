@@ -55,6 +55,11 @@ COUNT_RE = re.compile(r"(\d+) (passed|failed|errors?|skipped|xfailed|xpassed)")
 FAIL_RE = re.compile(r"^(FAILED|ERROR) (\S+)")
 
 
+def fail_setup(msg):
+    print(f"hermes-webui-test-all: {msg}", file=sys.stderr)
+    sys.exit(2)
+
+
 def log(msg):
     print(msg, flush=True)
 
@@ -189,17 +194,17 @@ def main():
     top = subprocess.run(["git", "-C", str(start), "rev-parse", "--show-toplevel"],
                          capture_output=True, text=True)
     if top.returncode != 0:
-        sys.exit(f"not inside a git checkout: {start}")
+        fail_setup(f"not inside a git checkout: {start}")
     repo = Path(top.stdout.strip())
     if not (repo / "scripts" / "test.sh").is_file():
-        sys.exit(f"{repo} does not look like hermes-webui (no scripts/test.sh)")
+        fail_setup(f"{repo} does not look like hermes-webui (no scripts/test.sh)")
 
     CACHE.mkdir(parents=True, exist_ok=True)
     lock = open(CACHE / ".lock", "w")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-        sys.exit("another hermes-webui-test-all run is in progress")
+        fail_setup("another hermes-webui-test-all run is in progress")
     prune_old_runs()
     run_dir = CACHE / time.strftime("%Y%m%d-%H%M%S")
     run_dir.mkdir()
