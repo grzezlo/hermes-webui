@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Run test-all.py from the tools branch, whatever the checkout has checked out.
+# Install a copy outside the checkout, e.g.:
+#   git show gz/tools:hermes-webui-test-all > ~/.local/bin/hermes-webui-test-all
+#   chmod +x ~/.local/bin/hermes-webui-test-all
+# The tests run in the git checkout containing the current directory (or --repo).
+set -euo pipefail
+
+repo="${HERMES_WEBUI_REPO:-$HOME/hermes-webui}"
+tools=gz/tools
+tmp="$(mktemp -d "${TMPDIR:-/tmp}/hermes-webui-test-all.XXXXXX")"
+trap 'rm -rf "$tmp"' EXIT
+git -C "$repo" show "refs/heads/$tools:test-all.py" > "$tmp/test-all.py" || {
+  printf '[hermes-webui-test-all] Cannot read test-all.py from %s in %s.\n' "$tools" "$repo" >&2
+  exit 1
+}
+python3 -I "$tmp/test-all.py" "$@"
