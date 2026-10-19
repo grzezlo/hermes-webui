@@ -2,4 +2,4 @@
 # on top of upstream/master + gz/tools. Comments start with #.
 # Remove a topic once upgrade.sh reports it is already in upstream/master.
 feat/screen-reader-mode               # PR #8305
-fix/terminal-input-order              # PR #8341
+fix/file-tree-keyboard-access         # PR #8384
