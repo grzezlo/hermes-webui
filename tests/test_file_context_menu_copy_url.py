@@ -52,7 +52,8 @@ HARNESS = r"""
 const [sources, cases] = JSON.parse(require('fs').readFileSync(0, 'utf8'));
 function el(tag){
   return {tag, children: [], style: {}, textContent: '', className: '',
-    appendChild(c){ this.children.push(c); return c; }, remove(){}, setAttribute(){}};
+    appendChild(c){ this.children.push(c); return c; }, remove(){}, setAttribute(){},
+    getBoundingClientRect(){ return {left: 0, top: 0, right: 0, bottom: 0, width: 0, height: 0}; }};
 }
 const window = {innerWidth: 1000, innerHeight: 800};
 const run = new Function(
