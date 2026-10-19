@@ -3,3 +3,5 @@
 # Remove a topic once upgrade.sh reports it is already in upstream/master.
 feat/screen-reader-mode               # PR #8305
 fix/file-tree-keyboard-access         # PR #8384
+feat/file-copy-url                    # PR #8393
+ext/pr-8263-tree-long-press           # PR #8263 (Haoke98): tree-row long-press menu + Set as New Workspace
