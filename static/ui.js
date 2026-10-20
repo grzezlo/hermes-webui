@@ -25299,6 +25299,7 @@ function _showFileContextMenu(e, item){
   menu.style.left=(e.clientX+140>vw?e.clientX-150:e.clientX)+'px';
   menu.style.top=(e.clientY+100>vh?e.clientY-100:e.clientY)+'px';
   const isDirLike=item.type==='dir'||(item.type==='symlink'&&item.is_dir);
+  const isExternalLink=item.type==='symlink'&&!!item.target_outside_workspace;
   const targetDir=isDirLike ? item.path : _workspaceParentDir(item.path);
   const isReadOnlyEscape=typeof _workspaceEscapeGrantForPath==='function' ? !!_workspaceEscapeGrantForPath(item.path) : false;
 
@@ -25405,7 +25406,6 @@ function _showFileContextMenu(e, item){
     // target outside the workspace 404s there. Kept inside the non-escape
     // block, and rechecked at click time (a grant may land while the menu is
     // open), so the copied URL never carries an escape grant token.
-    const isExternalLink=item.type==='symlink'&&!!item.target_outside_workspace;
     if(!isDirLike&&!isExternalLink){
       menu.appendChild(_workspaceContextMenuItem(t('copy_file_url'),()=>{
         menu.remove();
