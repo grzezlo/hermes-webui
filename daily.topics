@@ -3,3 +3,4 @@
 # Remove a topic once upgrade.sh reports it is already in upstream/master.
 feat/file-copy-url                    # PR #8393
 ext/pr-8263-tree-long-press           # PR #8263 (Haoke98): tree-row long-press menu + Set as New Workspace
+fix/hide-tool-source-sessions         # PR #8731: --source tool runs out of the sidebar window
