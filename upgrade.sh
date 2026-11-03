@@ -189,14 +189,16 @@ try:
     if index < len(argv) and argv[index] == '-c' and len(argv) == index + 2:
         # Accept the exact stdlib-only re-entry emitted by Hermes, not an
         # arbitrary command merely containing the expected server path.
+        # Newer Hermes adds "sys._hermes_relaunched = True" before run_path.
         tree = ast.parse(argv[index + 1])
-        if len(tree.body) == 4:
+        if len(tree.body) in (4, 5):
             root = ast.literal_eval(tree.body[1].value.args[1])
             args = ast.literal_eval(tree.body[2].value)
             if isinstance(root, str) and isinstance(args, list) and args and all(isinstance(x, str) for x in args):
+                marker = 'sys._hermes_relaunched = True; ' if len(tree.body) == 5 else ''
                 expected = ast.parse(
                     f'import sys, runpy; sys.path.insert(0, {root!r}); '
-                    f'sys.argv = {args!r}; runpy.run_path({args[0]!r}, run_name="__main__")'
+                    f'sys.argv = {args!r}; {marker}runpy.run_path({args[0]!r}, run_name="__main__")'
                 )
                 if ast.dump(tree) == ast.dump(expected):
                     target = args[0]

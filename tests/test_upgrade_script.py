@@ -142,8 +142,14 @@ def inline_runtime(fixture, *, target=None, python=None, code=None):
         runtime.wait(timeout=5)
 
 
-def test_dry_run_recognizes_hermes_inline_venv_runtime(upgrade_env):
-    with inline_runtime(upgrade_env) as pid:
+@pytest.mark.parametrize("marker", ["", "sys._hermes_relaunched = True; "])
+def test_dry_run_recognizes_hermes_inline_venv_runtime(upgrade_env, marker):
+    repo = upgrade_env[0]
+    target = str(repo / "server.py")
+    agent = str(repo.parent / "agent")
+    code = (f"import sys, runpy; sys.path.insert(0, {agent!r}); sys.argv = {[target]!r}; "
+            f"{marker}runpy.run_path({target!r}, run_name='__main__')")
+    with inline_runtime(upgrade_env, code=code) as pid:
         result = run_upgrade(upgrade_env, "--dry-run", SERVICE_PID=pid)
     assert result.returncode == 0, result.stdout + result.stderr
     assert str(upgrade_env[0].parent / "runtime-venv/bin/python") in result.stdout
@@ -288,7 +294,7 @@ def test_inline_runtime_from_another_checkout_is_rejected(upgrade_env):
     assert not any(call[0] == "runtime" or "restart" in call for call in calls(upgrade_env))
 
 
-@pytest.mark.parametrize("variant", ["hint_only", "extra_statement", "different_argv"])
+@pytest.mark.parametrize("variant", ["hint_only", "extra_statement", "different_argv", "other_marker"])
 def test_arbitrary_inline_code_is_not_used_as_runtime_proof(upgrade_env, variant):
     repo = upgrade_env[0]
     target = str(repo / "server.py")
@@ -301,6 +307,8 @@ def test_arbitrary_inline_code_is_not_used_as_runtime_proof(upgrade_env, variant
         code = prefix + f"runpy.run_path({target!r}, run_name='__main__')"
         if variant == "extra_statement":
             code += "; secret = 'fixture-secret-do-not-print'"
+        if variant == "other_marker":
+            code = prefix + "secret = 'fixture-secret-do-not-print'; " + code[len(prefix):]
     with inline_runtime(upgrade_env, code=code) as pid:
         result = run_upgrade(upgrade_env, SERVICE_PID=pid)
     assert result.returncode != 0
